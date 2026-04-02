@@ -1,4 +1,4 @@
-"""WSGI entry for gunicorn/uwsgi: gunicorn wsgi:app"""
+"""WSGI entry for production: gunicorn -c gunicorn.conf.py wsgi:app"""
 
 from app import create_app
 
