@@ -15,6 +15,7 @@ from supabase import Client
 from app.constants import (
     DEFAULT_BIAVIET_PROJECT_CODE,
     TABLE_FMS_RP_ENTRY_BIAVIET_260003,
+    TABLE_LDS_APP_CFG_SPECIAL_CONFIG,
     TABLE_LDS_GIFT_DEFINITIONS,
     TABLE_LDS_GIFT_INVENTORY,
     TABLE_LDS_LOCATIONS,
@@ -85,8 +86,17 @@ def _phone_exists(client: Client, phone: str) -> bool:
 
 
 def _fetch_inventory_with_definitions(
-    client: Client, project_code: str, location_id: str
+    client: Client,
+    project_code: str,
+    location_id: str,
+    *,
+    exclude_special: bool = False,
 ) -> List[GiftLine]:
+    """
+    Build weighted-redeem pool from inventory + definitions.
+    When exclude_special=True (normal redeem path), rows whose definition has is_special
+    are omitted so only non-special gifts can be drawn.
+    """
     inv_res = (
         client.table(TABLE_LDS_GIFT_INVENTORY)
         .select("id, gift_id, remaining")
@@ -124,6 +134,14 @@ def _fetch_inventory_with_definitions(
                 location_id,
             )
             continue
+        if exclude_special and definition.get("is_special"):
+            logger.debug(
+                "biaviet_redeem inventory row skipped: is_special excluded from normal pool "
+                "gift_id=%s code=%s",
+                gid,
+                definition.get("code"),
+            )
+            continue
         rem = int(row["remaining"])
         if rem <= 0:
             continue
@@ -153,6 +171,80 @@ def _restore_inventory_remaining(
         .eq("id", inventory_id)
         .execute()
     )
+
+
+def _fetch_enabled_special_config_for_phone(
+    client: Client, project_code: str, phone: str
+) -> Optional[Dict[str, Any]]:
+    res = (
+        client.table(TABLE_LDS_APP_CFG_SPECIAL_CONFIG)
+        .select("id, key_constraints, configs, project_code, is_enabled")
+        .eq("project_code", project_code)
+        .eq("is_enabled", True)
+        .eq("key_constraints", phone)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def _claim_special_config(client: Client, config_id: str) -> bool:
+    """Set is_enabled=false only if still enabled (single winner under concurrency)."""
+    res = (
+        client.table(TABLE_LDS_APP_CFG_SPECIAL_CONFIG)
+        .update({"is_enabled": False})
+        .eq("id", config_id)
+        .eq("is_enabled", True)
+        .execute()
+    )
+    updated = res.data or []
+    return len(updated) > 0
+
+
+def _re_enable_special_config(client: Client, config_id: str) -> None:
+    (
+        client.table(TABLE_LDS_APP_CFG_SPECIAL_CONFIG)
+        .update({"is_enabled": True})
+        .eq("id", config_id)
+        .execute()
+    )
+
+
+def _fetch_primary_special_gift_definition(
+    client: Client, project_code: str
+) -> Optional[Dict[str, Any]]:
+    res = (
+        client.table(TABLE_LDS_GIFT_DEFINITIONS)
+        .select(
+            "id, project_code, code, name, image_url, background_color, order_index, is_special"
+        )
+        .eq("project_code", project_code)
+        .eq("is_special", True)
+        .execute()
+    )
+    rows: List[Dict[str, Any]] = res.data or []
+    if not rows:
+        return None
+    rows.sort(
+        key=lambda r: (
+            r.get("order_index") is None,
+            r.get("order_index") if r.get("order_index") is not None else 0,
+            str(r.get("code") or ""),
+        )
+    )
+    return rows[0]
+
+
+def _gift_payload_from_definition(definition: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "gift_id": str(definition["id"]),
+        "gift_code": definition.get("code"),
+        "gift_name": definition.get("name"),
+        "image_url": definition.get("image_url"),
+        "background_color": definition.get("background_color"),
+        "is_special": definition.get("is_special"),
+    }
 
 
 def _decrement_inventory(
@@ -252,8 +344,123 @@ def submit_biaviet_redeem(
         loc_code,
     )
 
+    special_row = _fetch_enabled_special_config_for_phone(client, pc, phone)
+    if special_row:
+        special_def = _fetch_primary_special_gift_definition(client, pc)
+        if not special_def:
+            logger.error(
+                "biaviet_redeem special_list_match_but_no_is_special_gift project_code=%s "
+                "config_id=%s phone=%s",
+                pc,
+                special_row.get("id"),
+                _mask_phone(phone),
+            )
+            raise RedeemError(
+                "Special gift is not configured for this project (no is_special definition).",
+                500,
+                "SPECIAL_GIFT_NOT_CONFIGURED",
+            )
+        config_id = str(special_row["id"])
+        if _claim_special_config(client, config_id):
+            logger.info(
+                "biaviet_redeem special_config_claimed config_id=%s phone=%s gift_id=%s",
+                config_id,
+                _mask_phone(phone),
+                special_def.get("id"),
+            )
+            now = _utc_now_iso()
+            gift_payload = _gift_payload_from_definition(special_def)
+            gift_data = {
+                "gifts": {gift_payload["gift_id"]: 1},
+                "gift": gift_payload,
+                "redeem_source": "special_config",
+                "special_config_id": config_id,
+            }
+            insert_row: Dict[str, Any] = {
+                "created_at": now,
+                "updated_at": now,
+                "created_by": created_by,
+                "phone_number": phone,
+                "customer_name": name,
+                "bill_number": bill_number,
+                "sale_data": sale_data,
+                "gift_data": gift_data,
+                "other_data": other_data,
+                "location_code": loc_code,
+                "location_name": location_name or None,
+            }
+            try:
+                ins = (
+                    client.table(TABLE_FMS_RP_ENTRY_BIAVIET_260003)
+                    .insert(insert_row)
+                    .execute()
+                )
+                rows = ins.data or []
+                entry = rows[0] if rows else None
+            except APIError as exc:
+                detail = exc.args[0] if exc.args else {}
+                msg = (
+                    detail.get("message", str(exc))
+                    if isinstance(detail, dict)
+                    else str(exc)
+                )
+                logger.exception(
+                    "biaviet_redeem special_insert_failed phone=%s config_id=%s api_error=%s",
+                    _mask_phone(phone),
+                    config_id,
+                    msg,
+                )
+                _re_enable_special_config(client, config_id)
+                logger.warning(
+                    "biaviet_redeem special_config_re_enabled_after_insert_fail config_id=%s",
+                    config_id,
+                )
+                raise RedeemError(msg, 500, "INSERT_FAILED") from exc
+
+            if not entry:
+                logger.error(
+                    "biaviet_redeem special_insert_empty phone=%s config_id=%s",
+                    _mask_phone(phone),
+                    config_id,
+                )
+                _re_enable_special_config(client, config_id)
+                raise RedeemError("Failed to create entry.", 500, "INSERT_FAILED")
+
+            entry_id = entry.get("id")
+            logger.info(
+                "biaviet_redeem success_special entry_id=%s phone=%s gift_code=%s config_id=%s",
+                entry_id,
+                _mask_phone(phone),
+                gift_payload.get("gift_code"),
+                config_id,
+            )
+            return {
+                "success": True,
+                "redeem_mode": "special",
+                "customer": {
+                    "phone_number": phone,
+                    "customer_name": name,
+                },
+                "location": {
+                    "code": loc_code,
+                    "name": location_name,
+                    "project_code": pc,
+                },
+                "gift": gift_payload,
+                "entry": entry,
+            }
+
+        logger.info(
+            "biaviet_redeem special_config_not_claimed_race phone=%s project_code=%s "
+            "falling_back_to_random",
+            _mask_phone(phone),
+            pc,
+        )
+
     for attempt in range(max_decrement_retries):
-        lines = _fetch_inventory_with_definitions(client, pc, location_id)
+        lines = _fetch_inventory_with_definitions(
+            client, pc, location_id, exclude_special=True
+        )
         if not lines:
             logger.warning(
                 "biaviet_redeem no_stock location_id=%s project_code=%s phone=%s",
@@ -312,11 +519,7 @@ def submit_biaviet_redeem(
         )
 
     now = _utc_now_iso()
-    gift_payload = {
-        "gift_id": chosen.gift_id,
-        "gift_code": chosen.definition.get("code"),
-        "gift_name": chosen.definition.get("name"),
-    }
+    gift_payload = _gift_payload_from_definition(chosen.definition)
     gift_data = {
         "gifts": {chosen.gift_id: 1},
         "gift": gift_payload,
@@ -391,6 +594,7 @@ def submit_biaviet_redeem(
 
     return {
         "success": True,
+        "redeem_mode": "random",
         "customer": {
             "phone_number": phone,
             "customer_name": name,
