@@ -7,4 +7,4 @@ TABLE_LDS_GIFT_DEFINITIONS = "lds_mst_gift_definitions"
 TABLE_LDS_APP_CFG_SPECIAL_CONFIG = "lds_app_cfg_special_config"
 
 # Fallback if route does not pass config; prefer FMS_BIAVIET_PROJECT_CODE from Flask config / env.
-DEFAULT_BIAVIET_PROJECT_CODE = "nexts-gs-biaviet-2600003"
+DEFAULT_BIAVIET_PROJECT_CODE = "nexts-gs-biaviet-260003"
