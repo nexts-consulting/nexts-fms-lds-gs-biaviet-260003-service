@@ -34,5 +34,5 @@ class Config:
 
     # Gift redeem / LDS master data (must match rows in lds_* tables)
     FMS_BIAVIET_PROJECT_CODE = os.environ.get(
-        "FMS_BIAVIET_PROJECT_CODE", "nexts-gs-biaviet-2600003"
+        "FMS_BIAVIET_PROJECT_CODE", "nexts-gs-biaviet-260003"
     ).strip()
